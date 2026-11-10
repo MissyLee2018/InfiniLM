@@ -720,7 +720,7 @@ class TestActiveSetBudget:
 
     def test_running_requests_consume_part_of_the_cap(self):
         sched = sla_scheduler(batch_size_lower=1, batch_size_upper=64)
-        feed(sched, 0.2, 1, times=100)  # 高压历史 -> cap = 5
+        feed(sched, 0.2, 1, times=100)  # high-pressure history -> cap = 5
         for i in range(3):
             make_decode_request(sched, request_id=f"d{i}")
         for i in range(10):
@@ -735,7 +735,7 @@ class TestActiveSetBudget:
 
     def test_saturated_active_set_still_serves_decode(self):
         sched = sla_scheduler(batch_size_lower=1, batch_size_upper=64)
-        feed(sched, 0.2, 1, times=100)  # 高压历史 -> cap = 5
+        feed(sched, 0.2, 1, times=100)  # high-pressure history -> cap = 5
         for i in range(5):
             make_decode_request(sched, request_id=f"d{i}")
         for i in range(4):
@@ -809,7 +809,7 @@ class TestPrefillStarvationCap:
             out = sched.schedule()
             assert out is not None and out.is_prefill is True
         assert sched.prefill_starvation_steps == 2
-        # 第 3 步：waiting 仍然非空，但必须让位给 decode
+        # Step 3: waiting is still non-empty, but must yield to decode
         make_waiting_request(sched, request_id="w-late")
         out = sched.schedule()
         assert out is not None and out.is_prefill is False
@@ -881,7 +881,7 @@ def _run_all():
 
 
 # ---------------------------------------------------------------------------
-# 排队补齐（--sla-queue-refill）：突发时不让放行被卡成涓流
+# Queue refill (--sla-queue-refill): do not let a burst throttle admission to a trickle
 # ---------------------------------------------------------------------------
 
 
@@ -912,7 +912,7 @@ class TestSlaQueueRefill:
         sched = sla_scheduler(
             batch_size_lower=4, batch_size_upper=64, sla_queue_refill=False
         )
-        feed(sched, 0.05, 32, times=100)  # 带内、实测批 32
+        feed(sched, 0.05, 32, times=100)  # inside the band, observed batch 32
         assert sched._update_sla_bounds(32, 400) == 32
 
     def test_on_raises_the_bound_to_the_backlog(self):
@@ -922,7 +922,7 @@ class TestSlaQueueRefill:
         feed(sched, 0.05, 32, times=100)
         assert sched._update_sla_bounds(32, 400) == 64  # min(32+400, B_max=64)
         assert sched.b_low == 64
-        assert sched.b_high >= sched.b_low  # 不变量：下界不超过上界
+        assert sched.b_high >= sched.b_low  # invariant: low <= high
 
     def test_on_admits_the_whole_backlog_when_it_fits(self):
         sched = sla_scheduler(
@@ -947,12 +947,12 @@ class TestSlaQueueRefill:
         off = sla_scheduler(
             batch_size_lower=4, batch_size_upper=64, sla_queue_refill=False
         )
-        feed(on, 0.2, 32, times=100)  # 远超 sla_high = 0.055
+        feed(on, 0.2, 32, times=100)  # far above sla_high = 0.055
         feed(off, 0.2, 32, times=100)
         assert on._update_sla_bounds(32, 400) == off._update_sla_bounds(32, 400) == 32
 
     def test_integrated_schedule_opens_admission(self):
-        """整条链：waiting 非空 + 延迟还在带内 ⇒ cap 抬到需求、放行额度 > 0。"""
+        """End to end: waiting non-empty + latency inside the band => cap rises to demand and admission budget > 0."""
         sched = sla_scheduler(
             batch_size_lower=4, batch_size_upper=64, sla_queue_refill=True
         )
@@ -962,7 +962,7 @@ class TestSlaQueueRefill:
             make_waiting_request(sched, request_id=f"w{i}")
         feed(sched, 0.05, 8, times=100)
         sched.schedule()
-        assert sched.current_max_batch_size == 28  # 在跑 8 + 等待 20
+        assert sched.current_max_batch_size == 28  # 8 running + 20 waiting
         assert sched.prefill_budget == 20
 
     def test_integrated_schedule_stays_old_without_the_flag(self):
@@ -975,11 +975,11 @@ class TestSlaQueueRefill:
             make_waiting_request(sched, request_id=f"w{i}")
         feed(sched, 0.05, 8, times=100)
         sched.schedule()
-        assert sched.current_max_batch_size == 8  # 旧行为：贴住同时在跑的请求数
+        assert sched.current_max_batch_size == 8  # old: cap hugs running count
         assert sched.prefill_budget == 0
 
     def test_flag_is_inert_without_the_controller(self):
-        """SLA 关时该开关无害：cap 恒为 max_batch_size（对照组行为不变）。"""
+        """With SLA off the knob is inert: cap stays at max_batch_size (control-arm behaviour unchanged)."""
         sched = make_scheduler(
             max_batch_size=32,
             enable_sla_constraint=False,
