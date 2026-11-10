@@ -165,6 +165,9 @@ class SchedulerOutput:
     ):
         self.scheduled_requests = scheduled_requests
         self.num_requests = len(scheduled_requests)
+        # Tokens actually scheduled on a prefill step (used by the SLA
+        # channel-2 online prefill-rate estimate; unused on decode steps).
+        self.num_scheduled_tokens = 0
         self.is_prefill = is_prefill
         self.speculative_cache_ops = speculative_cache_ops
         self.kv_connector_metadata = None
@@ -207,6 +210,9 @@ class Scheduler:
         enable_memory_aware_batching: bool = False,
         memory_usage_factor: float = 0.95,
         enable_batch_stats: bool = False,
+        enable_sla_prefill_ctrl: bool = False,
+        sla_prefill_budget_s: float = 4.0,
+        sla_prefill_chunk_min: int = 1024,
     ):
         if nsa_owner_pool_epoch is not None and (
             connector is not None or has_mamba_cache
@@ -291,6 +297,32 @@ class Scheduler:
         self.num_decode_steps = 0
         # ---- Tier-1 probe: prefill starvation cap (see schedule()) ----
         self.max_prefill_starvation_steps = max(0, int(max_prefill_starvation_steps))
+        # ---- SLA channel 2: adaptive prefill chunking (default off) ----
+        # Kunlun measurement: prefill throughput is token-linear (~500 tok/s)
+        # with no batching gain, so oversized chunks buy nothing and only
+        # starve decode. With the flag on, the per-step prefill token budget
+        # converges online to
+        #   chunk = clip(sla_prefill_budget_s * rate, chunk_min,
+        #                max_num_batched_tokens)
+        # from the measured prefill rate (see record_prefill_step).
+        self.enable_sla_prefill_ctrl = bool(enable_sla_prefill_ctrl)
+        self.sla_prefill_budget_s = float(sla_prefill_budget_s)
+        self.sla_prefill_chunk_min = max(1, int(sla_prefill_chunk_min))
+        self.prefill_step_history: deque = deque(maxlen=int(sla_history_window))
+        self.prefill_rate_est: float = 0.0  # online tokens/s estimate
+        # Cold start: no prefill observation yet => static budget, identical
+        # to the behaviour before this knob existed.
+        self.current_prefill_chunk: int = int(max_num_batched_tokens)
+        if self.enable_sla_prefill_ctrl and self.max_prefill_starvation_steps == 0:
+            # Companion control: chunking alone does not bound decode
+            # starvation (measured streaks of 27 prefill-only steps), so
+            # default the tier-1 probe to K=4.
+            self.max_prefill_starvation_steps = 4
+            logger.warning(
+                "enable_sla_prefill_ctrl is on but max_prefill_starvation_steps "
+                "is unset; defaulting to K=4 (chunking alone does not bound "
+                "decode starvation)"
+            )
         self.prefill_starvation_steps = 0  # consecutive prefill-only steps
         self.num_forced_decode_steps = 0  # how often the cap fired
         self._force_decode_this_step = False
@@ -326,6 +358,42 @@ class Scheduler:
         self.decode_latency_history.append(float(latency))
         self.decode_batch_history.append(int(batch_size))
         self.num_decode_steps += 1
+
+    def record_prefill_step(self, num_tokens: int, latency: float) -> None:
+        """Record one prefill step for the SLA channel-2 control loop.
+
+        Called by ``LLMEngine.step()`` after executing a prefill batch.
+        Estimates the prefill throughput (tokens/s) over a sliding window and
+        converges the chunk to ``sla_prefill_budget_s * rate``. Only affects
+        scheduling when ``enable_sla_prefill_ctrl`` is on; with measurement
+        only (``enable_batch_stats``) the rate is recorded but not applied.
+        """
+        if num_tokens <= 0 or latency <= 0:
+            return
+        if not (self.enable_sla_prefill_ctrl or self.enable_batch_stats):
+            return
+        self.prefill_step_history.append((int(num_tokens), float(latency)))
+        tot_tok = sum(t for t, _ in self.prefill_step_history)
+        tot_sec = sum(s for _, s in self.prefill_step_history)
+        if tot_sec > 0:
+            self.prefill_rate_est = tot_tok / tot_sec
+        if self.enable_sla_prefill_ctrl and self.prefill_rate_est > 0:
+            self.current_prefill_chunk = int(
+                min(
+                    max(
+                        self.sla_prefill_budget_s * self.prefill_rate_est,
+                        self.sla_prefill_chunk_min,
+                    ),
+                    self.max_num_batched_tokens,
+                )
+            )
+
+    def _prefill_token_cap(self) -> int:
+        """Per-step prefill token budget: the adaptive chunk when channel 2
+        is on, otherwise the static ``max_num_batched_tokens``."""
+        if self.enable_sla_prefill_ctrl:
+            return self.current_prefill_chunk
+        return self.max_num_batched_tokens
 
     def _compute_prefill_budget(self, num_running: int) -> int:
         """Max new (prefill) admissions this step.
@@ -538,6 +606,12 @@ class Scheduler:
             "max_prefill_starvation_steps": self.max_prefill_starvation_steps,
             "prefill_starvation_steps": self.prefill_starvation_steps,
             "num_forced_decode_steps": self.num_forced_decode_steps,
+            # Channel 2: when disabled, current_prefill_chunk is pinned at
+            # max_num_batched_tokens (the static budget).
+            "enable_sla_prefill_ctrl": self.enable_sla_prefill_ctrl,
+            "current_prefill_chunk": self._prefill_token_cap(),
+            "prefill_rate_est": self.prefill_rate_est,
+            "num_prefill_steps_recorded": len(self.prefill_step_history),
             "sla_latency": self.sla_latency,
             "sla_low": self.sla_low,
             "sla_high": self.sla_high,
@@ -689,7 +763,7 @@ class Scheduler:
             return False
         return (
             current_num_batched_tokens + num_tokens_this_step
-            > self.max_num_batched_tokens
+            > self._prefill_token_cap()
         )
 
     def schedule(self) -> Optional[SchedulerOutput]:
@@ -744,7 +818,7 @@ class Scheduler:
             not self._force_decode_this_step
             and waiting_to_inspect > 0
             and len(scheduled_requests) < self.prefill_budget
-            and current_num_batched_tokens < self.max_num_batched_tokens
+            and current_num_batched_tokens < self._prefill_token_cap()
         ):
             waiting_to_inspect -= 1
             try:
@@ -927,6 +1001,7 @@ class Scheduler:
                     else None
                 ),
             )
+            scheduler_output.num_scheduled_tokens = current_num_batched_tokens
             if self.connector is not None:
                 meta = self.connector.build_connector_meta()
                 scheduler_output.kv_connector_metadata = meta

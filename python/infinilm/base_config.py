@@ -135,6 +135,9 @@ class BaseConfig:
         self.sla_mem_bound_accurate = self.args.sla_mem_bound_accurate
         self.sla_admission_fallback = self.args.sla_admission_fallback
         self.max_prefill_starvation_steps = self.args.max_prefill_starvation_steps
+        self.enable_sla_prefill_ctrl = self.args.enable_sla_prefill_ctrl
+        self.sla_prefill_budget_s = self.args.sla_prefill_budget
+        self.sla_prefill_chunk_min = self.args.sla_prefill_chunk_min
         self.enable_memory_aware_batching = self.args.enable_memory_aware_batching
         self.memory_usage_factor = self.args.memory_usage_factor
         self.enable_batch_stats = self.args.enable_batch_stats
@@ -561,6 +564,30 @@ class BaseConfig:
             "identical to runs without this flag)",
         )
         sla.add_argument(
+            "--enable-sla-prefill-ctrl",
+            action="store_true",
+            help="SLA channel 2: adapt the per-step prefill token budget from "
+            "the online prefill-rate estimate (chunk = sla_prefill_budget_s x "
+            "rate, clamped to [sla_prefill_chunk_min, max_num_batched_tokens]). "
+            "If --max-prefill-starvation-steps is left at 0 it is auto-set to "
+            "4 (chunking alone does not bound decode starvation). "
+            "Default off: behaviour is bit-identical to runs without this flag",
+        )
+        sla.add_argument(
+            "--sla-prefill-budget",
+            type=float,
+            default=4.0,
+            help="target seconds per prefill step for --enable-sla-prefill-ctrl "
+            "(default: 4.0)",
+        )
+        sla.add_argument(
+            "--sla-prefill-chunk-min",
+            type=int,
+            default=1024,
+            help="lower bound of the adaptive prefill chunk in tokens "
+            "(default: 1024)",
+        )
+        sla.add_argument(
             "--enable-memory-aware-batching",
             action="store_true",
             help="enable the memory-aware batch bound b_mem (paper Algorithm 1)",
@@ -647,6 +674,7 @@ class BaseConfig:
             ("cambricon", ["cnmon"]),
             ("ascend", ["npu-smi"]),
             ("moore", ["mthreads-gmi"]),
+            ("kunlun", ["xpu-smi"]),
             ("metax", ["mx-smi", "ht-smi"]),
             ("hygon", ["hy-smi"]),
             ("iluvatar", ["ixsmi"]),

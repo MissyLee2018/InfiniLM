@@ -138,6 +138,9 @@ class InferenceServer:
         sla_mem_bound_accurate: bool = False,
         sla_admission_fallback: bool = False,
         max_prefill_starvation_steps: int = 0,
+        enable_sla_prefill_ctrl: bool = False,
+        sla_prefill_budget_s: float = 4.0,
+        sla_prefill_chunk_min: int = 1024,
         enable_memory_aware_batching: bool = False,
         memory_usage_factor: float = 0.95,
         enable_batch_stats: bool = False,
@@ -215,6 +218,9 @@ class InferenceServer:
         self.sla_mem_bound_accurate = sla_mem_bound_accurate
         self.sla_admission_fallback = sla_admission_fallback
         self.max_prefill_starvation_steps = max_prefill_starvation_steps
+        self.enable_sla_prefill_ctrl = enable_sla_prefill_ctrl
+        self.sla_prefill_budget_s = sla_prefill_budget_s
+        self.sla_prefill_chunk_min = sla_prefill_chunk_min
         self.enable_memory_aware_batching = enable_memory_aware_batching
         self.memory_usage_factor = memory_usage_factor
         self.enable_batch_stats = enable_batch_stats
@@ -274,6 +280,9 @@ class InferenceServer:
                 sla_mem_bound_accurate=self.sla_mem_bound_accurate,
                 sla_admission_fallback=self.sla_admission_fallback,
                 max_prefill_starvation_steps=self.max_prefill_starvation_steps,
+                enable_sla_prefill_ctrl=self.enable_sla_prefill_ctrl,
+                sla_prefill_budget_s=self.sla_prefill_budget_s,
+                sla_prefill_chunk_min=self.sla_prefill_chunk_min,
                 enable_memory_aware_batching=self.enable_memory_aware_batching,
                 memory_usage_factor=self.memory_usage_factor,
                 enable_batch_stats=self.enable_batch_stats,
@@ -726,6 +735,9 @@ def main():
         sla_mem_bound_accurate=cfg.sla_mem_bound_accurate,
         sla_admission_fallback=cfg.sla_admission_fallback,
         max_prefill_starvation_steps=cfg.max_prefill_starvation_steps,
+        enable_sla_prefill_ctrl=cfg.enable_sla_prefill_ctrl,
+        sla_prefill_budget_s=cfg.sla_prefill_budget_s,
+        sla_prefill_chunk_min=cfg.sla_prefill_chunk_min,
         enable_memory_aware_batching=cfg.enable_memory_aware_batching,
         memory_usage_factor=cfg.memory_usage_factor,
         enable_batch_stats=cfg.enable_batch_stats,

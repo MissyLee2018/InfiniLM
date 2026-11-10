@@ -62,6 +62,14 @@ class EngineConfig:
             hold. Budgets already positive are left untouched.
         max_prefill_starvation_steps: Force one decode step after this many
             consecutive prefill-only steps (0 = disabled).
+        enable_sla_prefill_ctrl: SLA channel 2 - adapt the per-step prefill
+            token budget from the online prefill-rate estimate
+            (chunk = sla_prefill_budget_s * rate, clamped to
+            [sla_prefill_chunk_min, max_num_batched_tokens]). If
+            max_prefill_starvation_steps is left at 0 it is auto-set to 4,
+            because chunking alone does not bound decode starvation.
+        sla_prefill_budget_s: Target seconds per prefill step for channel 2.
+        sla_prefill_chunk_min: Lower bound of the adaptive chunk in tokens.
         enable_memory_aware_batching: Whether to enable the memory-aware batch
             bound (paper Algorithm 1).
         memory_usage_factor: Fraction of total KV blocks the memory bound may
@@ -114,6 +122,12 @@ class EngineConfig:
     sla_mem_bound_accurate: bool = False  # see docstring
     sla_admission_fallback: bool = False  # see docstring
     max_prefill_starvation_steps: int = 0
+    # SLA channel 2 (default off): adaptive prefill chunking from the online
+    # prefill-rate estimate (see docstring). Off => scheduling is bit-identical
+    # to before this knob existed.
+    enable_sla_prefill_ctrl: bool = False
+    sla_prefill_budget_s: float = 4.0
+    sla_prefill_chunk_min: int = 1024
     enable_memory_aware_batching: bool = False  # paper Algorithm 1
     memory_usage_factor: float = 0.95  # epsilon_M
     # Measurement only: record decode step latency / batch size even when the
@@ -187,6 +201,11 @@ class EngineConfig:
                 raise ValueError("sla_history_window must be >= 1")
             if self.max_prefill_starvation_steps < 0:
                 raise ValueError("max_prefill_starvation_steps must be >= 0")
+        if self.enable_sla_prefill_ctrl:
+            if self.sla_prefill_budget_s <= 0:
+                raise ValueError("sla_prefill_budget_s must be > 0")
+            if self.sla_prefill_chunk_min < 1:
+                raise ValueError("sla_prefill_chunk_min must be >= 1")
 
         if not 0.0 < self.memory_usage_factor <= 1.0:
             raise ValueError("memory_usage_factor must be in (0, 1]")

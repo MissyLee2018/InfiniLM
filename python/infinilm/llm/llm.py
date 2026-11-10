@@ -206,6 +206,9 @@ class LLMEngine:
                 enable_memory_aware_batching=config.enable_memory_aware_batching,
                 memory_usage_factor=config.memory_usage_factor,
                 enable_batch_stats=config.enable_batch_stats,
+                enable_sla_prefill_ctrl=config.enable_sla_prefill_ctrl,
+                sla_prefill_budget_s=config.sla_prefill_budget_s,
+                sla_prefill_chunk_min=config.sla_prefill_chunk_min,
             )
             if model_engine.model_type == "videonsa":
                 self.model_runner.bind_nsa_scheduler(self.scheduler)
@@ -307,6 +310,16 @@ class LLMEngine:
             record = getattr(self.scheduler, "record_decode_step", None)
             if record is not None:
                 record(step_elapsed, scheduler_output.num_requests)
+        # SLA channel 2: record prefill steps (tokens, wall time) for the
+        # online prefill-rate estimate. With the knob off, record_prefill_step
+        # returns immediately and behaviour is bit-identical to before.
+        if scheduler_output.is_prefill and scheduler_output.num_requests > 0:
+            record_pf = getattr(self.scheduler, "record_prefill_step", None)
+            if record_pf is not None:
+                record_pf(
+                    getattr(scheduler_output, "num_scheduled_tokens", 0),
+                    step_elapsed,
+                )
         # Validate the entire returned batch before connector, KV, token or queue
         # consumption. Native writes/SPEC reservation commits already happened.
         if (
@@ -583,6 +596,9 @@ class LLM:
         enable_memory_aware_batching: bool = False,
         memory_usage_factor: float = 0.95,
         enable_batch_stats: bool = False,
+        enable_sla_prefill_ctrl: bool = False,
+        sla_prefill_budget_s: float = 4.0,
+        sla_prefill_chunk_min: int = 1024,
     ):
         """Initialize LLM.
 
@@ -652,6 +668,9 @@ class LLM:
             enable_memory_aware_batching=enable_memory_aware_batching,
             memory_usage_factor=memory_usage_factor,
             enable_batch_stats=enable_batch_stats,
+            enable_sla_prefill_ctrl=enable_sla_prefill_ctrl,
+            sla_prefill_budget_s=sla_prefill_budget_s,
+            sla_prefill_chunk_min=sla_prefill_chunk_min,
         )
         self.engine = LLMEngine(config)
         self.config = config
@@ -842,6 +861,9 @@ class AsyncLLMEngine:
         enable_memory_aware_batching: bool = False,
         memory_usage_factor: float = 0.95,
         enable_batch_stats: bool = False,
+        enable_sla_prefill_ctrl: bool = False,
+        sla_prefill_budget_s: float = 4.0,
+        sla_prefill_chunk_min: int = 1024,
     ):
         """Initialize AsyncLLMEngine.
 
@@ -916,6 +938,9 @@ class AsyncLLMEngine:
             enable_memory_aware_batching=enable_memory_aware_batching,
             memory_usage_factor=memory_usage_factor,
             enable_batch_stats=enable_batch_stats,
+            enable_sla_prefill_ctrl=enable_sla_prefill_ctrl,
+            sla_prefill_budget_s=sla_prefill_budget_s,
+            sla_prefill_chunk_min=sla_prefill_chunk_min,
         )
         self.engine = LLMEngine(config)
         self.engine._async_abort_owner = True

@@ -1162,5 +1162,118 @@ class TestSlaAdmissionFallback:
         assert plain._compute_prefill_budget(0) == flagged._compute_prefill_budget(0)
 
 
+# ---------------------------------------------------------------------------
+# SLA channel 2: adaptive prefill chunking
+# ---------------------------------------------------------------------------
+
+
+class TestSlaPrefillCtrl:
+    def test_config_defaults_keep_channel2_off(self):
+        cfg = EngineConfig(model_path="/tmp/model")
+        assert cfg.enable_sla_prefill_ctrl is False
+        assert cfg.sla_prefill_budget_s == approx(4.0)
+        assert cfg.sla_prefill_chunk_min == 1024
+
+    def test_config_validation(self):
+        base = dict(model_path="/tmp/model", enable_sla_prefill_ctrl=True)
+        with raises(ValueError, match="sla_prefill_budget_s"):
+            EngineConfig(sla_prefill_budget_s=0.0, **base)
+        with raises(ValueError, match="sla_prefill_chunk_min"):
+            EngineConfig(sla_prefill_chunk_min=0, **base)
+        EngineConfig(**base)  # valid surface accepted
+
+    def test_disabled_keeps_static_token_cap(self):
+        sched = make_scheduler()
+        assert sched.enable_sla_prefill_ctrl is False
+        assert sched._prefill_token_cap() == sched.max_num_batched_tokens
+
+    def test_record_disabled_is_a_noop(self):
+        sched = make_scheduler()
+        sched.record_prefill_step(1000, 1.0)
+        assert len(sched.prefill_step_history) == 0
+        assert sched.prefill_rate_est == 0.0
+
+    def test_measurement_only_records_but_does_not_adapt(self):
+        sched = make_scheduler(enable_batch_stats=True, max_num_batched_tokens=8192)
+        sched.record_prefill_step(2000, 1.0)
+        assert sched.prefill_rate_est == approx(2000.0)
+        # measurement only: the chunk stays pinned at the static budget
+        assert sched._prefill_token_cap() == 8192
+
+    def _ctrl_scheduler(self, **kwargs):
+        params = dict(
+            enable_sla_prefill_ctrl=True,
+            sla_prefill_budget_s=4.0,
+            sla_prefill_chunk_min=1024,
+            max_num_batched_tokens=8192,
+        )
+        params.update(kwargs)
+        return make_scheduler(**params)
+
+    def test_chunk_converges_to_budget_times_rate(self):
+        sched = self._ctrl_scheduler()
+        sched.record_prefill_step(2000, 1.0)  # rate 2000 tok/s
+        assert sched._prefill_token_cap() == 8000
+
+    def test_chunk_is_clamped_to_chunk_min(self):
+        sched = self._ctrl_scheduler()
+        sched.record_prefill_step(100, 1.0)  # rate 100 -> 400 < chunk_min
+        assert sched._prefill_token_cap() == 1024
+
+    def test_chunk_is_clamped_to_static_max(self):
+        sched = self._ctrl_scheduler()
+        sched.record_prefill_step(100000, 1.0)  # rate far above the cap
+        assert sched._prefill_token_cap() == 8192
+
+    def test_rate_uses_the_sliding_window(self):
+        sched = self._ctrl_scheduler(sla_history_window=2)
+        sched.record_prefill_step(1000, 1.0)
+        sched.record_prefill_step(3000, 1.0)
+        sched.record_prefill_step(2000, 2.0)  # evicts the first sample
+        # window holds (3000, 1.0) + (2000, 2.0): rate = 5000 / 3
+        assert sched.prefill_rate_est == approx(5000.0 / 3.0)
+
+    def test_auto_sets_starvation_cap_to_four(self):
+        sched = make_scheduler(enable_sla_prefill_ctrl=True)
+        assert sched.max_prefill_starvation_steps == 4
+        explicit = make_scheduler(
+            enable_sla_prefill_ctrl=True, max_prefill_starvation_steps=8
+        )
+        assert explicit.max_prefill_starvation_steps == 8
+
+    def test_stats_report_channel2_state(self):
+        sched = self._ctrl_scheduler()
+        sched.record_prefill_step(2000, 1.0)
+        stats = sched.get_dynamic_batch_stats()
+        assert stats["enable_sla_prefill_ctrl"] is True
+        assert stats["num_prefill_steps_recorded"] == 1
+        assert stats["prefill_rate_est"] == approx(2000.0)
+        assert stats["current_prefill_chunk"] == 8000
+
+    def test_schedule_uses_adaptive_token_cap(self):
+        sched = make_scheduler(
+            enable_sla_prefill_ctrl=True,
+            sla_prefill_budget_s=1.0,
+            sla_prefill_chunk_min=128,
+            max_num_batched_tokens=100000,
+        )
+        sched.record_prefill_step(128, 1.0)  # rate 128 -> chunk = 128
+        assert sched._prefill_token_cap() == 128
+        make_waiting_request(sched, prompt_len=100, request_id="a")
+        make_waiting_request(sched, prompt_len=100, request_id="b")
+        out = sched.schedule()
+        assert out is not None and out.is_prefill
+        # 100 + 100 > 128: the second request is deferred to a later step
+        assert out.num_requests == 1
+        assert out.num_scheduled_tokens == 100
+
+    def test_schedule_disabled_admits_both(self):
+        sched = make_scheduler(max_num_batched_tokens=100000)
+        make_waiting_request(sched, prompt_len=100, request_id="a")
+        make_waiting_request(sched, prompt_len=100, request_id="b")
+        out = sched.schedule()
+        assert out is not None and out.num_requests == 2
+
+
 if __name__ == "__main__":
     sys.exit(_run_all())
